@@ -42,6 +42,9 @@ function parseArgs(argv) {
     verify: false,
     provider: "serper",
     json: false,
+    agentSummary: false,
+    candidatesOut: null,
+    rootCheck: false,
     preflight: false,
     history: null,
     hideSeen: false,
@@ -62,6 +65,9 @@ function parseArgs(argv) {
       case "--verify": a.verify = true; break;
       case "--provider": a.provider = v; i++; break;
       case "--json": a.json = true; break;
+      case "--agent-summary": a.agentSummary = true; break;
+      case "--candidates-out": a.candidatesOut = v; i++; break;
+      case "--root-check": a.rootCheck = true; break;
       case "--preflight": a.preflight = true; break;
       case "--history": a.history = v; i++; break;
       case "--hide-seen": a.hideSeen = true; break;
@@ -89,6 +95,10 @@ Optional:
   --verify            reverse-search no-site/social rows for off-profile sites
   --provider <name>   reverse-search provider: serper, brave, exa (default serper)
   --json              print JSON rows to stdout; progress goes to stderr
+  --agent-summary     print a compact markdown summary instead of full JSON rows
+  --candidates-out <file>
+                      write prioritized outreach candidates to a separate CSV
+  --root-check        for DEAD HTTP path URLs, test scheme://host/ before selecting
   --preflight         show configured/missing API keys and exit
   --history <file>    local JSONL dedupe history, keyed by Google place_id
   --hide-seen         omit places already present in --history
@@ -106,6 +116,7 @@ Env:
 Example:
   GOOGLE_MAPS_API_KEY=AIza... node find-leads.mjs --type plumber --city "Austin, TX"
   node find-leads.mjs --type plumber --city "Austin, TX" --verify --provider serper --json
+  node find-leads.mjs --type plumber --city "Austin, TX" --verify --agent-summary --candidates-out candidates.csv --root-check
   node find-leads.mjs --type plumber --city "Austin, TX" --history .stalesites/history.jsonl --hide-seen
 `;
 
@@ -287,6 +298,34 @@ export async function classifyWebsite(url) {
   }
 }
 
+function rootUrlOf(url) {
+  try {
+    const u = new URL(url);
+    return `${u.protocol}//${u.host}/`;
+  } catch {
+    return "";
+  }
+}
+
+async function applyRootCheck(row) {
+  if (!row.website || row.status !== "DEAD") return row;
+  if (!/^HTTP 4\d\d$/.test(row.detail || "")) return row;
+  const root = rootUrlOf(row.website);
+  if (!root || root === row.website) return row;
+
+  const rootStatus = await classifyWebsite(root);
+  row.root_url = root;
+  row.root_status = rootStatus.status;
+  row.root_detail = rootStatus.detail;
+
+  if (rootStatus.status === "HAS_SITE") {
+    row.status = "HAS_SITE";
+    row.detail = `${row.detail}; root live: ${rootStatus.detail}`;
+    row.rejection_reason = "profile deep link is dead, but root website is live";
+  }
+  return row;
+}
+
 // ---------- Google Places (New) Text Search ----------
 async function textSearch({ apiKey, textQuery, region, max }) {
   const places = [];
@@ -360,8 +399,17 @@ const PRIORITY = {
   HAS_SITE: 6,
 };
 
+const CANDIDATE_STATUSES = new Set([
+  "CONFIRMED_NO_SITE",
+  "SOCIAL_ONLY",
+  "PARKED",
+  "DEAD",
+  "SITE_FOUND_OFFLIST",
+  "NO_WEBSITE",
+]);
+
 function log(args, msg) {
-  if (args.json) process.stderr.write(msg);
+  if (args.json || args.agentSummary) process.stderr.write(msg);
   else process.stdout.write(msg);
 }
 
@@ -369,6 +417,65 @@ function normalizeProvider(provider) {
   const p = String(provider || "").toLowerCase();
   if (!PROVIDERS.includes(p)) throw new Error(`Unknown --provider "${provider}". Use: ${PROVIDERS.join(", ")}`);
   return p;
+}
+
+function candidateRows(rows) {
+  return rows.filter((r) => CANDIDATE_STATUSES.has(r.status));
+}
+
+function rowReason(row) {
+  if (row.status === "CONFIRMED_NO_SITE") return "no own-site found by reverse search";
+  if (row.status === "NO_WEBSITE") return "no website on Google profile; unverified";
+  if (row.status === "SOCIAL_ONLY") return `profile points to social/directory: ${row.detail}`;
+  if (row.status === "PARKED") return row.detail || "website looks parked";
+  if (row.status === "DEAD") return `profile website check failed: ${row.detail}`;
+  if (row.status === "SITE_FOUND_OFFLIST") return `no profile website, but reverse search found: ${row.found_url || row.detail}`;
+  return row.detail || "";
+}
+
+function markdownSummary({ args, textQuery, rows, candidates, outPath, candidatesOutPath, requests, verifyQueries, cost }) {
+  const counts = rows.reduce((m, r) => ((m[r.status] = (m[r.status] || 0) + 1), m), {});
+  const lines = [
+    `# StaleSites Agent Summary`,
+    ``,
+    `Search: ${textQuery}`,
+    `Scanned: ${rows.length}`,
+    `Lead candidates: ${candidates.length}`,
+    `Output CSV: ${outPath}`,
+  ];
+  if (candidatesOutPath) lines.push(`Candidates CSV: ${candidatesOutPath}`);
+  lines.push(
+    ``,
+    `## Counts`,
+    ``,
+    `- CONFIRMED_NO_SITE: ${counts.CONFIRMED_NO_SITE || 0}`,
+    `- NO_WEBSITE: ${counts.NO_WEBSITE || 0}`,
+    `- SOCIAL_ONLY: ${counts.SOCIAL_ONLY || 0}`,
+    `- PARKED: ${counts.PARKED || 0}`,
+    `- DEAD: ${counts.DEAD || 0}`,
+    `- SITE_FOUND_OFFLIST: ${counts.SITE_FOUND_OFFLIST || 0}`,
+    `- HAS_SITE: ${counts.HAS_SITE || 0}`,
+    ``,
+    `## Top Candidates`,
+    ``
+  );
+  for (const [i, row] of candidates.slice(0, 10).entries()) {
+    lines.push(`${i + 1}. ${row.name} — ${row.status} — ${row.phone || "no phone"} — ${rowReason(row)}`);
+    if (row.website) lines.push(`   Website: ${row.website}`);
+    if (row.found_url) lines.push(`   Found URL: ${row.found_url}`);
+  }
+  lines.push(
+    ``,
+    `## Cost`,
+    ``,
+    `- Places requests: ${requests} (~$${cost}, first 1,000/mo free)`,
+    `- Reverse-search queries: ${args.verify ? verifyQueries : 0}${args.verify ? ` via ${args.provider}` : ""}`,
+    ``,
+    `## Suggested Agent Flow`,
+    ``,
+    `Review only these candidates first. For HTTP 404/path failures, verify the root domain before generating preview or outreach packets. Generate packets only after the contact set is approved.`
+  );
+  return `${lines.join("\n")}\n`;
 }
 
 async function verifyRows(rows, args) {
@@ -476,6 +583,10 @@ async function main() {
       match_reason: "",
       verify_provider: "",
       verified_status: "",
+      root_url: "",
+      root_status: "",
+      root_detail: "",
+      rejection_reason: "",
       seen_before: p._seen?.seen_before || false,
       first_seen: p._seen?.first_seen || "",
       last_seen: p._seen?.last_seen || "",
@@ -484,6 +595,12 @@ async function main() {
       maps_url: p.googleMapsUri || "",
     };
   });
+
+  if (args.rootCheck) {
+    const rootCandidates = rows.filter((r) => r.website && r.status === "DEAD" && /^HTTP 4\d\d$/.test(r.detail || ""));
+    if (rootCandidates.length) process.stderr.write(`Root-checking ${rootCandidates.length} dead HTTP path URL(s)...\n`);
+    await mapPool(rootCandidates, Math.min(args.concurrency, 4), applyRootCheck);
+  }
 
   let verifyQueries = 0;
   if (args.verify) {
@@ -497,7 +614,8 @@ async function main() {
   // write CSV
   const header = [
     "place_id", "name", "phone", "status", "detail", "website", "found_url", "website_urls",
-    "match_reason", "verify_provider", "verified_status", "seen_before", "first_seen",
+    "match_reason", "verify_provider", "verified_status", "root_url", "root_status",
+    "root_detail", "rejection_reason", "seen_before", "first_seen",
     "last_seen", "category", "address", "maps_url",
   ];
   const csv = [header.join(",")]
@@ -507,13 +625,34 @@ async function main() {
   const outPath = args.out || `leads-${slug(args.type)}-${slug(args.city)}.csv`;
   writeFileSync(outPath, csv);
 
+  const candidates = candidateRows(rows);
+  if (args.candidatesOut) {
+    const candidatesCsv = [header.join(",")]
+      .concat(candidates.map((r) => header.map((h) => csvCell(r[h])).join(",")))
+      .join("\n");
+    writeFileSync(args.candidatesOut, candidatesCsv);
+  }
+
   if (args.json) {
     console.log(JSON.stringify(rows, null, 2));
+  } else if (args.agentSummary) {
+    const cost = (requests * 0.035).toFixed(3);
+    console.log(markdownSummary({
+      args,
+      textQuery,
+      rows,
+      candidates,
+      outPath,
+      candidatesOutPath: args.candidatesOut,
+      requests,
+      verifyQueries,
+      cost,
+    }));
   }
 
   // summary
   const counts = rows.reduce((m, r) => ((m[r.status] = (m[r.status] || 0) + 1), m), {});
-  const leads = (counts.CONFIRMED_NO_SITE || 0) + (counts.NO_WEBSITE || 0) + (counts.SOCIAL_ONLY || 0) + (counts.PARKED || 0) + (counts.DEAD || 0) + (counts.SITE_FOUND_OFFLIST || 0);
+  const leads = candidates.length;
   // Enterprise Text Search: ~$35/1k requests, first 1,000/mo free.
   const cost = (requests * 0.035).toFixed(3);
 
@@ -529,6 +668,7 @@ async function main() {
   log(args, `  ${counts.HAS_SITE || 0}  have a working site  (deprioritized)\n`);
   log(args, `  => ${leads} outreach targets\n`);
   log(args, `\nWrote ${outPath}\n`);
+  if (args.candidatesOut) log(args, `Wrote ${args.candidatesOut}\n`);
   log(args, `API cost this run: ${requests} Places request(s) ~ $${cost} (first 1,000/mo are free).\n`);
   if (args.verify) log(args, `Reverse-search queries this run: ${verifyQueries} via ${args.provider}.\n`);
 }

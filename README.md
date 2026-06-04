@@ -1,6 +1,6 @@
 # StaleSites
 
-Find local businesses on Google Maps with no website, a social-only presence, or a weak/dead site. Use the CSV for manual outreach, or pass `--json` so an agent can parse the lead list directly.
+Find local businesses on Google Maps with no website, a social-only presence, or a weak/dead site. Use the CSV for manual outreach, or pass `--agent-summary` so an agent can review a compact candidate sheet without dumping every Google result into context.
 
 ## Quick Start
 
@@ -13,7 +13,17 @@ For a local clone:
 ```bash
 cp .env.example .env
 node lead-engine/find-leads.mjs --preflight
-node lead-engine/find-leads.mjs --type plumber --city "Austin, TX" --verify --provider serper --history .stalesites/history.jsonl --hide-seen --out leads.csv
+node lead-engine/find-leads.mjs \
+  --type plumber \
+  --city "Austin, TX" \
+  --verify \
+  --provider serper \
+  --history .stalesites/history.jsonl \
+  --hide-seen \
+  --root-check \
+  --agent-summary \
+  --out leads.csv \
+  --candidates-out candidates.csv
 ```
 
 ## API Keys
@@ -41,7 +51,10 @@ Options:
 - `--concurrency <n>` parallel website checks, default 8.
 - `--verify` reverse-search `NO_WEBSITE` and `SOCIAL_ONLY` rows.
 - `--provider serper|brave|exa` verification provider, default `serper`.
-- `--json` print lead array to stdout for agents.
+- `--json` print full lead array to stdout for agents. This can be verbose; prefer `--agent-summary` for normal agent loops.
+- `--agent-summary` print compact markdown with counts and top candidates to stdout.
+- `--candidates-out <file>` write only prioritized outreach candidates to a separate CSV.
+- `--root-check` for `DEAD` HTTP path URLs, test the root domain before selecting; if the root is live, downgrade the row to `HAS_SITE` with a rejection reason.
 - `--preflight` show configured/missing API keys.
 - `--history <file>` read/write local JSONL dedupe history keyed by Google `place_id`.
 - `--hide-seen` omit businesses already present in `--history`.
@@ -77,6 +90,8 @@ The history stores only lightweight dedupe events: `place_id`, timestamp, search
 - `NO_WEBSITE` — pre-verification no-site status when `--verify` is not run.
 
 CSV columns: `place_id`, `name`, `phone`, `status`, `detail`, `website`, `found_url`, `website_urls`, `match_reason`, `verify_provider`, `verified_status`, `seen_before`, `first_seen`, `last_seen`, `category`, `address`, `maps_url`.
+
+With `--root-check`, CSV also includes `root_url`, `root_status`, `root_detail`, and `rejection_reason`.
 
 URL fields:
 - `website` — website URL from the Google Business profile.
