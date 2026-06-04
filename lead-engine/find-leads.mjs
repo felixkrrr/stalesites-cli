@@ -20,7 +20,7 @@
 //
 // No npm install needed (Node 18+ / built-in fetch).
 
-import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -43,6 +43,11 @@ function parseArgs(argv) {
     provider: "serper",
     json: false,
     preflight: false,
+    history: null,
+    hideSeen: false,
+    includeSeen: false,
+    seenWindowDays: 0,
+    markSeen: true,
   };
   for (let i = 2; i < argv.length; i++) {
     const k = argv[i];
@@ -58,6 +63,11 @@ function parseArgs(argv) {
       case "--provider": a.provider = v; i++; break;
       case "--json": a.json = true; break;
       case "--preflight": a.preflight = true; break;
+      case "--history": a.history = v; i++; break;
+      case "--hide-seen": a.hideSeen = true; break;
+      case "--include-seen": a.includeSeen = true; break;
+      case "--seen-window-days": a.seenWindowDays = parseInt(v, 10); i++; break;
+      case "--no-mark-seen": a.markSeen = false; break;
       case "-h": case "--help": a.help = true; break;
     }
   }
@@ -80,6 +90,12 @@ Optional:
   --provider <name>   reverse-search provider: serper, brave, exa (default serper)
   --json              print JSON rows to stdout; progress goes to stderr
   --preflight         show configured/missing API keys and exit
+  --history <file>    local JSONL dedupe history, keyed by Google place_id
+  --hide-seen         omit places already present in --history
+  --include-seen      keep seen places, but annotate seen_before/first_seen/last_seen
+  --seen-window-days <n>
+                      with --hide-seen, only hide places seen in the last n days
+  --no-mark-seen      read --history but do not append this run's place_ids
 
 Env:
   GOOGLE_MAPS_API_KEY   required — a key with "Places API (New)" enabled
@@ -90,6 +106,7 @@ Env:
 Example:
   GOOGLE_MAPS_API_KEY=AIza... node find-leads.mjs --type plumber --city "Austin, TX"
   node find-leads.mjs --type plumber --city "Austin, TX" --verify --provider serper --json
+  node find-leads.mjs --type plumber --city "Austin, TX" --history .stalesites/history.jsonl --hide-seen
 `;
 
 function loadDotenv() {
@@ -132,6 +149,80 @@ function preflight() {
   console.log("  Serper:        https://serper.dev/");
   console.log("  Brave:         https://brave.com/search/api/");
   console.log("  Exa:           https://exa.ai/");
+}
+
+// ---------- local dedupe history ----------
+function searchKey(args) {
+  return `${args.type || ""} in ${args.city || ""}`.trim();
+}
+
+function loadHistory(file) {
+  const seen = new Map();
+  if (!file || !existsSync(file)) return seen;
+  const lines = readFileSync(file, "utf8").split(/\r?\n/);
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      const event = JSON.parse(line);
+      if (!event.place_id) continue;
+      const prev = seen.get(event.place_id);
+      if (!prev) {
+        seen.set(event.place_id, {
+          place_id: event.place_id,
+          first_seen: event.first_seen || event.seen_at || "",
+          last_seen: event.last_seen || event.seen_at || "",
+          search_keys: event.search_key ? [event.search_key] : [],
+        });
+        continue;
+      }
+      if (event.seen_at && (!prev.first_seen || event.seen_at < prev.first_seen)) prev.first_seen = event.seen_at;
+      if (event.seen_at && (!prev.last_seen || event.seen_at > prev.last_seen)) prev.last_seen = event.seen_at;
+      if (event.search_key && !prev.search_keys.includes(event.search_key)) prev.search_keys.push(event.search_key);
+    } catch {
+      // Ignore malformed lines; one bad history event should not break a run.
+    }
+  }
+  return seen;
+}
+
+function isWithinSeenWindow(historyEntry, days) {
+  if (!historyEntry) return false;
+  if (!days || days <= 0) return true;
+  const last = Date.parse(historyEntry.last_seen || "");
+  if (!Number.isFinite(last)) return true;
+  return Date.now() - last <= days * 24 * 60 * 60 * 1000;
+}
+
+function annotatePlace(p, historyEntry) {
+  p._seen = {
+    seen_before: Boolean(historyEntry),
+    first_seen: historyEntry?.first_seen || "",
+    last_seen: historyEntry?.last_seen || "",
+  };
+  return p;
+}
+
+function appendHistory(file, places, args) {
+  if (!file || !args.markSeen || !places.length) return;
+  mkdirSync(dirname(file), { recursive: true });
+  const now = new Date().toISOString();
+  const key = searchKey(args);
+  const lines = places
+    .filter((p) => p.id)
+    .map((p) => JSON.stringify({
+      place_id: p.id,
+      seen_at: now,
+      search_key: key,
+      status: p._lead_status || "",
+    }));
+  if (lines.length) appendFileSync(file, `${lines.join("\n")}\n`);
+}
+
+function websiteUrls(row) {
+  return [row.website, row.found_url]
+    .filter(Boolean)
+    .filter((v, i, a) => a.indexOf(v) === i)
+    .join(" ");
 }
 
 // ---------- website classification ----------
@@ -309,7 +400,7 @@ async function verifyRows(rows, args) {
         row.verified_status = found.status;
         row.status = "SITE_FOUND_OFFLIST";
         row.detail = `found off Google profile: ${found.status}${found.detail ? ` (${found.detail})` : ""}`;
-        row.website = row.website || match.url;
+        row.website_urls = websiteUrls(row);
       } else if (row.status === "NO_WEBSITE") {
         row.verified_status = "CONFIRMED_NO_SITE";
         row.status = "CONFIRMED_NO_SITE";
@@ -323,6 +414,7 @@ async function verifyRows(rows, args) {
       row.verified_status = row.status;
       row.detail = `${row.detail || row.status}; verify error: ${e.message || e}`;
     }
+    row.website_urls = websiteUrls(row);
   });
 
   return { rows, verifyQueries, skipped: false };
@@ -353,21 +445,40 @@ async function main() {
   const { places, requests } = await textSearch({
     apiKey, textQuery, region: args.region, max: args.max,
   });
-  process.stderr.write(`Found ${places.length} businesses in ${requests} API request(s). Checking websites...\n`);
+  let placesForRun = places;
+  const history = loadHistory(args.history);
+  if (args.history) {
+    placesForRun = places.map((p) => annotatePlace(p, history.get(p.id)));
+    const seenCount = placesForRun.filter((p) => p._seen.seen_before).length;
+    if (args.hideSeen) {
+      const before = placesForRun.length;
+      placesForRun = placesForRun.filter((p) => !isWithinSeenWindow(history.get(p.id), args.seenWindowDays));
+      process.stderr.write(`History: ${seenCount} seen before; hiding ${before - placesForRun.length}; ${placesForRun.length} new/eligible.\n`);
+    } else {
+      process.stderr.write(`History: ${seenCount} seen before; keeping all results with seen annotations.\n`);
+    }
+  }
+  process.stderr.write(`Found ${places.length} businesses in ${requests} API request(s). Checking ${placesForRun.length} website(s)...\n`);
 
-  const rows = await mapPool(places, args.concurrency, async (p) => {
+  const rows = await mapPool(placesForRun, args.concurrency, async (p) => {
     const url = p.websiteUri || "";
     const { status, detail } = await classifyWebsite(url);
+    p._lead_status = status;
     return {
+      place_id: p.id || "",
       name: p.displayName?.text || "",
       phone: p.nationalPhoneNumber || "",
       status,
       detail,
       website: url,
       found_url: "",
+      website_urls: url,
       match_reason: "",
       verify_provider: "",
       verified_status: "",
+      seen_before: p._seen?.seen_before || false,
+      first_seen: p._seen?.first_seen || "",
+      last_seen: p._seen?.last_seen || "",
       category: p.primaryTypeDisplayName?.text || "",
       address: p.formattedAddress || "",
       maps_url: p.googleMapsUri || "",
@@ -379,13 +490,15 @@ async function main() {
     const verified = await verifyRows(rows, args);
     verifyQueries = verified.verifyQueries;
   }
+  appendHistory(args.history, placesForRun, args);
 
   rows.sort((a, b) => (PRIORITY[a.status] - PRIORITY[b.status]) || a.name.localeCompare(b.name));
 
   // write CSV
   const header = [
-    "name", "phone", "status", "detail", "website", "found_url", "match_reason",
-    "verify_provider", "verified_status", "category", "address", "maps_url",
+    "place_id", "name", "phone", "status", "detail", "website", "found_url", "website_urls",
+    "match_reason", "verify_provider", "verified_status", "seen_before", "first_seen",
+    "last_seen", "category", "address", "maps_url",
   ];
   const csv = [header.join(",")]
     .concat(rows.map((r) => header.map((h) => csvCell(r[h])).join(",")))

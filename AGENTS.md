@@ -8,6 +8,12 @@ Run this CLI to find local businesses by type + city, classify their website sta
 npx github:felixkrrr/stalesites-cli -- --type plumber --city "Austin, TX" --verify --provider serper --json
 ```
 
+For repeat prospecting, use local history so repeated searches do not keep returning the same businesses:
+
+```bash
+npx github:felixkrrr/stalesites-cli -- --type plumber --city "Austin, TX" --verify --provider serper --history .stalesites/history.jsonl --hide-seen --json
+```
+
 For a local clone:
 
 ```bash
@@ -39,18 +45,39 @@ This reports which keys are present or missing without exposing values.
 CSV is always written to `--out` or `leads-<type>-<city>.csv`. With `--json`, the lead array is also printed to stdout and progress/summary logs go to stderr.
 
 Lead object fields:
+- `place_id`
 - `name`
 - `phone`
 - `status`
 - `detail`
 - `website`
 - `found_url`
+- `website_urls`
 - `match_reason`
 - `verify_provider`
 - `verified_status`
+- `seen_before`
+- `first_seen`
+- `last_seen`
 - `category`
 - `address`
 - `maps_url`
+
+URL fields:
+- `website` is the URL on the Google profile.
+- `found_url` is an off-profile URL found by reverse search.
+- `website_urls` combines both so agents can show users every website URL to verify.
+
+## Repeat Searches
+
+Use `--history .stalesites/history.jsonl --hide-seen` when the user plans to run multiple searches over time. The CLI dedupes by Google `place_id`.
+
+Google Text Search is capped at roughly 60 results per exact query, so expand coverage by varying the query while reusing the same history file:
+- narrower services: `drain cleaning`, `water heater repair`, `emergency plumber`
+- nearby cities: `Round Rock, TX`, `Cedar Park, TX`
+- neighborhoods: `South Austin`, `East Austin`
+
+History is local JSONL and intentionally minimal: `place_id`, timestamp, search key, and status. Do not store or build a persistent resale database of full Places content.
 
 Statuses:
 - `CONFIRMED_NO_SITE` — reverse search found no own website.
