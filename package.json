@@ -1,0 +1,19 @@
+{
+  "name": "stalesites",
+  "version": "0.1.0",
+  "description": "Find local businesses with no website or weak web presence from Google Maps.",
+  "type": "module",
+  "bin": {
+    "stalesites": "./lead-engine/find-leads.mjs"
+  },
+  "files": [
+    ".env.example",
+    "AGENTS.md",
+    "README.md",
+    "lead-engine"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "UNLICENSED"
+}
